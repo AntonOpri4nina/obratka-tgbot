@@ -139,8 +139,21 @@ async def _ensure_topic(user, ctx: ContextTypes.DEFAULT_TYPE) -> int | None:
     return topic_id
 
 
-class _TopicDeleted(Exception):
-    """Топик удалён — нужно создать новый."""
+class _TopicGone(Exception):
+    """Топик удалён или закрыт — нужно создать новый."""
+
+
+# Ошибки Telegram, означающие что топик недоступен
+_TOPIC_GONE_MARKERS = (
+    "message thread not found",
+    "thread not found",
+    "message_thread_id_invalid",
+    "topic_closed",
+    "topic closed",
+    "topic is closed",
+    "topic_deleted",
+    "not found",
+)
 
 
 async def _forward_to_topic(msg, topic_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -148,11 +161,10 @@ async def _forward_to_topic(msg, topic_id: int, ctx: ContextTypes.DEFAULT_TYPE) 
     Пересылает сообщение в топик группы.
     Сначала пробует forward (сохраняет имя отправителя),
     при ошибке приватности — делает copy.
-    Поднимает _TopicDeleted если топик удалён.
+    Поднимает _TopicGone если топик удалён/закрыт.
     Возвращает True при успехе.
     """
-    _DELETED = ("message thread not found", "not found")
-
+    last_err = None
     for method in ("forward", "copy"):
         try:
             if method == "forward":
@@ -172,11 +184,11 @@ async def _forward_to_topic(msg, topic_id: int, ctx: ContextTypes.DEFAULT_TYPE) 
             return True
         except TelegramError as e:
             err = str(e).lower()
-            if any(marker in err for marker in _DELETED):
-                raise _TopicDeleted()
-            if method == "copy":
-                log.error("Не удалось переслать сообщение в топик: %s", e)
+            if any(marker in err for marker in _TOPIC_GONE_MARKERS):
+                raise _TopicGone()
+            last_err = e
 
+    log.error("Не удалось переслать сообщение в топик: %s", last_err)
     return False
 
 
@@ -197,36 +209,33 @@ async def from_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     msg  = update.message
     user = update.effective_user
     uid  = user.id
+    
+    ok = False
     is_new = get_topic(uid) is None
 
-    # Получаем / создаём топик
-    topic_id = await _ensure_topic(user, ctx)
-    if topic_id is None:
-        await msg.reply_text("⚠️ Произошла ошибка. Пожалуйста, попробуйте позже.")
-        return
-
-    # Пересылаем в группу
-    try:
-        ok = await _forward_to_topic(msg, topic_id, ctx)
-    except _TopicDeleted:
-        # Топик удалён — сбрасываем привязку и создаём новый
-        log.warning("Топик %s удалён, создаю новый для user %s", topic_id, uid)
-        reset_user(uid)
-        is_new = True
+    # Цикл из двух попыток: отправка в существующий топик / пересоздание при неудаче
+    for attempt in range(2):
+        # Получаем старый топик или создаём новый (если в базе пусто)
         topic_id = await _ensure_topic(user, ctx)
         if topic_id is None:
-            await msg.reply_text("⚠️ Произошла ошибка. Пожалуйста, попробуйте позже.")
+            await msg.reply_text("⚠️ Произошла ошибка на стороне сервера. Пожалуйста, попробуйте позже.")
             return
+
         try:
             ok = await _forward_to_topic(msg, topic_id, ctx)
-        except _TopicDeleted:
-            ok = False
+            if ok:
+                break  # Успешно доставили, выходим из цикла
+        except _TopicGone:
+            # Сюда мы падаем, если Telegram вернул ошибку, что топик удален
+            log.warning("Топик %s удалён или закрыт в Telegram. Пересоздаю для юзера %s (попытка %d/2)", topic_id, uid, attempt + 1)
+            reset_user(uid)  # Чистим JSON, чтобы на следующем круге _ensure_topic создал новый топик
+            is_new = True    # Включаем флаг первого сообщения, чтобы отправить полный текст-подтверждение
 
     if not ok:
         await msg.reply_text("⚠️ Не удалось отправить сообщение. Попробуйте ещё раз.")
         return
 
-    # Подтверждение
+    # Подтверждение отправки для пользователя
     if is_new:
         await msg.reply_text(
             "✅ Сообщение получено!\n"
